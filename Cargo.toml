@@ -1,0 +1,11 @@
+[package]
+name = "passing-macro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dummy-waker = "1.1.0"
+hashbrown = "0.14.2"
+proc-macro2 = "1.0.69"
+quote = "1.0.33"
+rustc-hash = "1.1.0"
