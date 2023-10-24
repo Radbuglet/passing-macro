@@ -37,7 +37,8 @@ struct SessionManager {
 }
 
 struct Session {
-    future: RefCell<Pin<Box<dyn Future<Output = TokenStream>>>>,
+    future: RefCell<Pin<Box<dyn Future<Output = ()>>>>,
+    next_emit_builder: RefCell<TokenStream>,
     state: RefCell<SessionState>,
 }
 
@@ -102,6 +103,12 @@ fn parse_pass_macro_args(input: TokenStream) -> PassMacroArgs {
             _ => break 'subsequent_call,
         };
 
+        // Expect a semicolon
+        match input.next() {
+            Some(TokenTree::Punct(punct)) if punct.as_char() == ';' => {}
+            _ => break 'subsequent_call,
+        };
+
         return PassMacroArgs::Resume {
             session: session_id,
             data: input,
@@ -113,13 +120,14 @@ fn parse_pass_macro_args(input: TokenStream) -> PassMacroArgs {
 }
 
 pub fn pass_macro<F>(
-    me: &TokenStream,
-    input: TokenStream,
+    me: impl ToTokens,
+    input: impl Into<TokenStream>,
     f: impl FnOnce(PassMacroSession, TokenStream) -> F,
 ) -> TokenStream
 where
-    F: Future<Output = TokenStream> + 'static,
+    F: Future<Output = ()> + 'static,
 {
+    let input = input.into();
     let input = parse_pass_macro_args(input);
 
     use_session_mgr(|mgr| {
@@ -134,6 +142,7 @@ where
                     session_id,
                     Session {
                         future: RefCell::new(Box::pin(future)),
+                        next_emit_builder: RefCell::new(TokenStream::default()),
                         state: RefCell::new(SessionState::Idle),
                     },
                 );
@@ -167,14 +176,14 @@ where
             .poll(&mut Context::from_waker(&dummy_waker::dummy_waker()))
         {
             // If the future has finished...
-            Poll::Ready(value) => {
+            Poll::Ready(()) => {
                 // Close the session
                 drop(future);
                 drop(sessions);
-                mgr.sessions.borrow_mut().remove(&session_id);
+                let session = mgr.sessions.borrow_mut().remove(&session_id).unwrap();
 
                 // And return the value
-                value
+                session.next_emit_builder.into_inner()
             }
             // Otherwise, figure out what it's requesting and service it.
             Poll::Pending => {
@@ -186,7 +195,8 @@ where
                     }
                     SessionState::Requesting(path) => {
                         let session_id = encode_session_id(session_id);
-                        quote! { #path!(__passing_macro_export #me #session_id) }
+                        let next_emit = session.next_emit_builder.take();
+                        quote! { #path!(__passing_macro_export #me ; #session_id); #next_emit }
                     }
                 }
             }
@@ -200,7 +210,21 @@ pub struct PassMacroSession {
 }
 
 impl PassMacroSession {
-    pub async fn fetch(self, path: TokenStream) -> TokenStream {
+    pub fn emit(self, data: impl ToTokens) {
+        use_session_mgr(|mgr| {
+            let sessions = &*mgr.sessions.borrow();
+            let session = sessions
+                .get(&self.id)
+                .expect("internal passing-macro error: session lost");
+
+            session
+                .next_emit_builder
+                .borrow_mut()
+                .extend(data.to_token_stream());
+        });
+    }
+
+    pub async fn fetch(self, path: impl ToTokens) -> TokenStream {
         let path = path.into_token_stream();
 
         // Transition from `idle` to `requesting`
@@ -247,7 +271,7 @@ impl PassMacroSession {
     }
 }
 
-pub fn export_data(vis: TokenStream, name: Ident, data: TokenStream) -> TokenStream {
+pub fn export_data(vis: impl ToTokens, name: Ident, data: impl ToTokens) -> TokenStream {
     let id = use_session_mgr(|mgr| {
         mgr.gen.set(mgr.gen.get() + 1);
         mgr.gen.get()
@@ -258,7 +282,7 @@ pub fn export_data(vis: TokenStream, name: Ident, data: TokenStream) -> TokenStr
         #[macro_export]
         #[doc(hidden)]
         macro_rules! #id {
-            (__passing_macro_export $target:path $($prefix:tt)*) => { $target!(__passing_macro_export $($prefix)* #data) };
+            (__passing_macro_export $target:path ; $($prefix:tt)*) => { $target!(__passing_macro_export $($prefix)* ; #data) };
         }
 
         #vis use #id as #name;
