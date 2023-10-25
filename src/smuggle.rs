@@ -357,9 +357,12 @@ impl<O: 'static + Send> SurrogateThread<O> {
         }
     }
 
-    pub fn fire(&self, func: impl 'static + Send + FnOnce() -> O) -> O {
+    pub fn dispatch(&self, func: impl 'static + Send + FnOnce() -> O) -> O {
         self.in_sender.send(Box::new(func)).unwrap();
-        self.out_receiver.recv().unwrap().unwrap()
+        match self.out_receiver.recv().unwrap() {
+            Ok(out) => out,
+            Err(err) => panic::resume_unwind(err),
+        }
     }
 }
 
@@ -374,14 +377,15 @@ pub fn smuggle<const N: usize>(
     // Serialize the input
     let input = inputs.map(SerializedTokenStream::from_native);
 
-    // Pass it to the worker, who deserializes it into the dispatch-safe fallback format, processes
-    // it, and returns its output in a serialized form.
+    // Pass it to the surrogate thread, who deserializes it proc_macro2's fallback format (which can
+    // persist across proc_macro invocations), processes it, and returns its output in a serialized
+    // form.
     thread_local! {
         static SURROGATE: SurrogateThread<SerializedTokenStream> = SurrogateThread::new();
     }
 
     let output = SURROGATE.with(move |v| {
-        v.fire(move || {
+        v.dispatch(move || {
             SerializedTokenStream::from_fallback(f(input.map(SerializedTokenStream::into_fallback)))
         })
     });
