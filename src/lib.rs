@@ -7,9 +7,14 @@ use std::{
 };
 
 use hashbrown::HashMap;
+use proc_macro::TokenStream as NativeTokenStream;
 use proc_macro2::{Ident, Span, TokenStream, TokenTree};
 use quote::{quote, ToTokens};
 use rustc_hash::FxHasher;
+
+extern crate proc_macro;
+
+mod smuggle;
 
 // === Hashing === //
 
@@ -120,87 +125,88 @@ fn parse_pass_macro_args(input: TokenStream) -> PassMacroArgs {
 }
 
 pub fn pass_macro<F>(
-    me: impl ToTokens,
-    input: impl Into<TokenStream>,
-    f: impl FnOnce(PassMacroSession, TokenStream) -> F,
-) -> TokenStream
+    me: NativeTokenStream,
+    input: NativeTokenStream,
+    f: impl 'static + Send + FnOnce(PassMacroSession, TokenStream) -> F,
+) -> NativeTokenStream
 where
     F: Future<Output = ()> + 'static,
 {
-    let input = input.into();
-    let input = parse_pass_macro_args(input);
+    smuggle::smuggle([me, input], |[me, input]| {
+        let input = parse_pass_macro_args(input);
 
-    use_session_mgr(|mgr| {
-        // Create a new session if we need to
-        let session_id = match &input {
-            PassMacroArgs::Resume { session, .. } => *session,
-            PassMacroArgs::Create { args } => {
-                mgr.gen.set(mgr.gen.get() + 1);
-                let session_id = mgr.gen.get();
-                let future = f(PassMacroSession { id: session_id }, args.clone());
-                mgr.sessions.borrow_mut().insert(
-                    session_id,
-                    Session {
-                        future: RefCell::new(Box::pin(future)),
-                        next_emit_builder: RefCell::new(TokenStream::default()),
-                        state: RefCell::new(SessionState::Idle),
-                    },
-                );
+        use_session_mgr(|mgr| {
+            // Create a new session if we need to
+            let session_id = match &input {
+                PassMacroArgs::Resume { session, .. } => *session,
+                PassMacroArgs::Create { args } => {
+                    mgr.gen.set(mgr.gen.get() + 1);
+                    let session_id = mgr.gen.get();
+                    let future = f(PassMacroSession { id: session_id }, args.clone());
+                    mgr.sessions.borrow_mut().insert(
+                        session_id,
+                        Session {
+                            future: RefCell::new(Box::pin(future)),
+                            next_emit_builder: RefCell::new(TokenStream::default()),
+                            state: RefCell::new(SessionState::Idle),
+                        },
+                    );
 
-                session_id
-            }
-        };
+                    session_id
+                }
+            };
 
-        // Now, fetch that session
-        let sessions = mgr.sessions.borrow();
-        let session = sessions
-            .get(&session_id)
-            .expect("internal passing-macro error: session lost");
+            // Now, fetch that session
+            let sessions = mgr.sessions.borrow();
+            let session = sessions
+                .get(&session_id)
+                .expect("internal passing-macro error: session lost");
 
-        // If this is a resumption call, mark the request as having been completed
-        if let PassMacroArgs::Resume { data, .. } = input {
-            let state = &mut *session.state.borrow_mut();
-            match state {
-                SessionState::Idle | SessionState::Resolved(_) => panic!(
-                    "session was not expecting additional tokens; did passing-macro forget some \
-					state?",
-                ),
-                SessionState::Requesting(_) => *state = SessionState::Resolved(data.collect()),
-            }
-        }
-
-        // Poll the future
-        let mut future = session.future.borrow_mut();
-        match future
-            .as_mut()
-            .poll(&mut Context::from_waker(&dummy_waker::dummy_waker()))
-        {
-            // If the future has finished...
-            Poll::Ready(()) => {
-                // Close the session
-                drop(future);
-                drop(sessions);
-                let session = mgr.sessions.borrow_mut().remove(&session_id).unwrap();
-
-                // And return the value
-                session.next_emit_builder.into_inner()
-            }
-            // Otherwise, figure out what it's requesting and service it.
-            Poll::Pending => {
+            // If this is a resumption call, mark the request as having been completed
+            if let PassMacroArgs::Resume { data, .. } = input {
                 let state = &mut *session.state.borrow_mut();
-
                 match state {
-                    SessionState::Idle | SessionState::Resolved(_) => {
-                        panic!("the pass_macro future suspended without fetching any data")
-                    }
-                    SessionState::Requesting(path) => {
-                        let session_id = encode_session_id(session_id);
-                        let next_emit = session.next_emit_builder.take();
-                        quote! { #path!(__passing_macro_export #me ; #session_id); #next_emit }
+                    SessionState::Idle | SessionState::Resolved(_) => panic!(
+						"session was not expecting additional tokens; did passing-macro forget some \
+						state?",
+					),
+                    SessionState::Requesting(_) => *state = SessionState::Resolved(data.collect()),
+                }
+            }
+
+            // Poll the future
+            let mut future = session.future.borrow_mut();
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(&dummy_waker::dummy_waker()))
+            {
+                // If the future has finished...
+                Poll::Ready(()) => {
+                    // Close the session
+                    drop(future);
+                    drop(sessions);
+                    let session = mgr.sessions.borrow_mut().remove(&session_id).unwrap();
+
+                    // And return the value
+                    session.next_emit_builder.into_inner()
+                }
+                // Otherwise, figure out what it's requesting and service it.
+                Poll::Pending => {
+                    let state = &mut *session.state.borrow_mut();
+
+                    match state {
+                        SessionState::Idle | SessionState::Resolved(_) => {
+                            panic!("the pass_macro future suspended without fetching any data")
+                        }
+                        SessionState::Requesting(path) => {
+                            let session_id = encode_session_id(session_id);
+                            let next_emit = session.next_emit_builder.take();
+                            quote! { #path!(__passing_macro_export #me ; #session_id); #next_emit }
+                        }
                     }
                 }
             }
-        }
+        })
     })
 }
 
@@ -282,7 +288,9 @@ pub fn export_data(vis: impl ToTokens, name: Ident, data: impl ToTokens) -> Toke
         #[macro_export]
         #[doc(hidden)]
         macro_rules! #id {
-            (__passing_macro_export $target:path ; $($prefix:tt)*) => { $target!(__passing_macro_export $($prefix)* ; #data) };
+            (__passing_macro_export $target:path ; $($prefix:tt)*) => {
+                $target!(__passing_macro_export $($prefix)* ; #data);
+            };
         }
 
         #vis use #id as #name;
