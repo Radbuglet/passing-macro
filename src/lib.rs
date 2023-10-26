@@ -1,298 +1,197 @@
 use std::{
-    cell::{Cell, RefCell},
-    future::Future,
-    hash,
-    pin::Pin,
-    task::{Context, Poll},
+    cell::RefCell,
+    panic::{catch_unwind, panic_any, resume_unwind, AssertUnwindSafe},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-use hashbrown::HashMap;
-use proc_macro::TokenStream as NativeTokenStream;
-use proc_macro2::{Ident, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Ident, Span, TokenStream, TokenTree};
 use quote::{quote, ToTokens};
-use rustc_hash::FxHasher;
 
-extern crate proc_macro;
+struct MissingContextPanicReason;
 
-mod smuggle;
-
-// === Hashing === //
-
-struct ConstSafeDefaultHasher<T>([T; 0]);
-
-impl<T: hash::Hasher + Default> hash::BuildHasher for ConstSafeDefaultHasher<T> {
-    type Hasher = T;
-
-    fn build_hasher(&self) -> Self::Hasher {
-        T::default()
-    }
+thread_local! {
+    static IMPORT_SESSION: RefCell<Option<ImportContextSession>> = RefCell::new(None);
 }
 
-type FxHashMap<K, V> = HashMap<K, V, ConstSafeDefaultHasher<FxHasher>>;
-
-const fn new_hash_map<K, V>() -> FxHashMap<K, V> {
-    FxHashMap::with_hasher(ConstSafeDefaultHasher([]))
+struct ImportContextSession {
+    requests: Vec<TokenStream>,
+    inputs: Vec<TokenStream>,
+    inputs_counter: usize,
 }
 
-// === Session Manager === //
+pub fn begin_import(
+    me: impl ToTokens,
+    input: impl Into<TokenStream>,
+    f: impl FnOnce(TokenStream) -> TokenStream,
+) -> TokenStream {
+    let mut input = input.into().into_iter();
 
-struct SessionManager {
-    gen: Cell<u64>,
-    sessions: RefCell<FxHashMap<u64, Session>>,
-}
+    // Begin the session
+    IMPORT_SESSION.with(|session| {
+        let mut session = session.borrow_mut();
 
-struct Session {
-    future: RefCell<Pin<Box<dyn Future<Output = ()>>>>,
-    next_emit_builder: RefCell<TokenStream>,
-    state: RefCell<SessionState>,
-}
+        // Ensure that this was not called reentrantly
+        assert!(session.is_none(), "cannot nest begin_import calls");
 
-enum SessionState {
-    Idle,
-    Requesting(TokenStream),
-    Resolved(TokenStream),
-}
+        // Collect the received inputs
+        let mut inputs = Vec::new();
 
-fn use_session_mgr<R>(f: impl FnOnce(&SessionManager) -> R) -> R {
-    thread_local! {
-        static SESSION_MANAGER: SessionManager =
-            const { SessionManager {
-                gen: Cell::new(0),
-                sessions: RefCell::new(new_hash_map()),
-            } };
-    }
-
-    SESSION_MANAGER.with(|mgr| f(mgr))
-}
-
-// === Session ID passing === //
-
-fn encode_session_id(v: u64) -> Ident {
-    Ident::new(&format!("s{v}"), Span::call_site())
-}
-
-pub fn decode_session_id(i: &Ident) -> u64 {
-    i.to_string()
-        .strip_prefix('s')
-        .unwrap()
-        .parse::<u64>()
-        .unwrap()
-}
-
-// === Main Functions === //
-
-enum PassMacroArgs {
-    Resume {
-        session: u64,
-        data: proc_macro2::token_stream::IntoIter,
-    },
-    Create {
-        args: TokenStream,
-    },
-}
-
-fn parse_pass_macro_args(input: TokenStream) -> PassMacroArgs {
-    // Handle resume syntax
-    'subsequent_call: {
-        let mut input = input.clone().into_iter();
-
-        // Expect `__passing_macro_export`
-        match input.next() {
-            Some(TokenTree::Ident(ident)) if ident == "__passing_macro_export" => {}
-            _ => break 'subsequent_call,
-        }
-
-        // Expect a session ID
-        let session_id = match input.next() {
-            Some(TokenTree::Ident(ident)) => decode_session_id(&ident),
-            _ => break 'subsequent_call,
-        };
-
-        // Expect a semicolon
-        match input.next() {
-            Some(TokenTree::Punct(punct)) if punct.as_char() == ';' => {}
-            _ => break 'subsequent_call,
-        };
-
-        return PassMacroArgs::Resume {
-            session: session_id,
-            data: input,
-        };
-    };
-
-    // Otherwise, handle create syntax
-    PassMacroArgs::Create { args: input }
-}
-
-pub fn pass_macro<F>(
-    me: NativeTokenStream,
-    input: NativeTokenStream,
-    f: impl 'static + Send + FnOnce(PassMacroSession, TokenStream) -> F,
-) -> NativeTokenStream
-where
-    F: Future<Output = ()> + 'static,
-{
-    smuggle::smuggle([me, input], |[me, input]| {
-        let input = parse_pass_macro_args(input);
-
-        use_session_mgr(|mgr| {
-            // Create a new session if we need to
-            let session_id = match &input {
-                PassMacroArgs::Resume { session, .. } => *session,
-                PassMacroArgs::Create { args } => {
-                    mgr.gen.set(mgr.gen.get() + 1);
-                    let session_id = mgr.gen.get();
-                    let future = f(PassMacroSession { id: session_id }, args.clone());
-                    mgr.sessions.borrow_mut().insert(
-                        session_id,
-                        Session {
-                            future: RefCell::new(Box::pin(future)),
-                            next_emit_builder: RefCell::new(TokenStream::default()),
-                            state: RefCell::new(SessionState::Idle),
-                        },
-                    );
-
-                    session_id
+        'parse: {
+            // Attempt to parse the prefix
+            {
+                let mut fork_input = input.clone();
+                match fork_input.next() {
+                    Some(TokenTree::Ident(ident)) if ident == "__import_context_passer" => {}
+                    _ => break 'parse,
                 }
+                input = fork_input;
+            }
+
+            let mut input = match input.next() {
+                Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket => {
+                    group.stream().into_iter()
+                }
+                _ => panic!("invalid __import_context_passer syntax"),
             };
 
-            // Now, fetch that session
-            let sessions = mgr.sessions.borrow();
-            let session = sessions
-                .get(&session_id)
-                .expect("internal passing-macro error: session lost");
-
-            // If this is a resumption call, mark the request as having been completed
-            if let PassMacroArgs::Resume { data, .. } = input {
-                let state = &mut *session.state.borrow_mut();
-                match state {
-                    SessionState::Idle | SessionState::Resolved(_) => panic!(
-						"session was not expecting additional tokens; did passing-macro forget some \
-						state?",
-					),
-                    SessionState::Requesting(_) => *state = SessionState::Resolved(data.collect()),
-                }
-            }
-
-            // Poll the future
-            let mut future = session.future.borrow_mut();
-            match future
-                .as_mut()
-                .poll(&mut Context::from_waker(&dummy_waker::dummy_waker()))
-            {
-                // If the future has finished...
-                Poll::Ready(()) => {
-                    // Close the session
-                    drop(future);
-                    drop(sessions);
-                    let session = mgr.sessions.borrow_mut().remove(&session_id).unwrap();
-
-                    // And return the value
-                    session.next_emit_builder.into_inner()
-                }
-                // Otherwise, figure out what it's requesting and service it.
-                Poll::Pending => {
-                    let state = &mut *session.state.borrow_mut();
-
-                    match state {
-                        SessionState::Idle | SessionState::Resolved(_) => {
-                            panic!("the pass_macro future suspended without fetching any data")
-                        }
-                        SessionState::Requesting(path) => {
-                            let session_id = encode_session_id(session_id);
-                            let next_emit = session.next_emit_builder.take();
-                            quote! { #path!(__passing_macro_export #me ; #session_id); #next_emit }
-                        }
+            loop {
+                match input.next() {
+                    Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => {
+                        inputs.push(group.stream())
                     }
+                    None => break,
+                    _ => panic!("invalid __import_context_passer syntax"),
                 }
             }
-        })
+        }
+
+        *session = Some(ImportContextSession {
+            requests: Vec::new(),
+            inputs,
+            inputs_counter: 0,
+        });
+    });
+
+    let input: TokenStream = input.collect();
+
+    // Attempt to complete the macro invocation
+    catch_unwind(AssertUnwindSafe(|| {
+        let output = f(input.clone());
+        IMPORT_SESSION.with(|session| session.borrow_mut().take());
+        output
+    }))
+    // However, if it failed...
+    .unwrap_or_else(|err| {
+        // Take out the session.
+        let session = IMPORT_SESSION
+            .with(|session| session.borrow_mut().take())
+            .unwrap();
+
+        // If the reason for panic was missing context...
+        if err.downcast_ref::<MissingContextPanicReason>().is_some() {
+            // Request more context with which to rerun the macro...
+            let inputs = &session.inputs;
+            let (first, requests) = session.requests[session.inputs_counter..]
+                .split_first()
+                // This panic couldn't have triggered without requesting at least one additional
+                // input.
+                .unwrap();
+
+            quote! {
+                #first! {
+                    __import_context_passer [
+                        #({ #inputs })*
+                        #((#requests))* (#me)
+                    ]
+                    #input
+                }
+            }
+        } else {
+            // Otherwise, propagate the panic.
+            resume_unwind(err);
+        }
     })
 }
 
-#[derive(Copy, Clone)]
-pub struct PassMacroSession {
-    id: u64,
+pub fn import(path: impl ToTokens) -> LazyTokenStream {
+    IMPORT_SESSION.with(|session| {
+        let mut session = session.borrow_mut();
+        let session = session
+            .as_mut()
+            .expect("can only `import` in a `begin_import` closure");
+
+        session.requests.push(path.into_token_stream());
+
+        LazyTokenStream(
+            if let Some(input) = session.inputs.get(session.inputs_counter) {
+                session.inputs_counter += 1;
+                Some(input.clone())
+            } else {
+                None
+            },
+        )
+    })
 }
 
-impl PassMacroSession {
-    pub fn emit(self, data: impl ToTokens) {
-        use_session_mgr(|mgr| {
-            let sessions = &*mgr.sessions.borrow();
-            let session = sessions
-                .get(&self.id)
-                .expect("internal passing-macro error: session lost");
+#[derive(Debug, Clone)]
+pub struct LazyTokenStream(Option<TokenStream>);
 
-            session
-                .next_emit_builder
-                .borrow_mut()
-                .extend(data.to_token_stream());
-        });
+impl LazyTokenStream {
+    pub fn clone_eval(&self) -> TokenStream {
+        self.clone().eval()
     }
 
-    pub async fn fetch(self, path: impl ToTokens) -> TokenStream {
-        let path = path.into_token_stream();
-
-        // Transition from `idle` to `requesting`
-        use_session_mgr(|mgr| {
-            let sessions = &*mgr.sessions.borrow();
-            let session = sessions
-                .get(&self.id)
-                .expect("internal passing-macro error: session lost");
-
-            let state = &mut *session.state.borrow_mut();
-
-            match state {
-                SessionState::Idle => *state = SessionState::Requesting(path),
-                SessionState::Requesting(_) => {
-                    panic!("this future is already waiting for a result")
-                }
-                SessionState::Resolved(_) => {
-                    panic!("the original fetch future has not yet consumed its result")
-                }
-            }
-        });
-
-        std::future::poll_fn(move |_cx| {
-            use_session_mgr(|mgr| {
-                let sessions = &*mgr.sessions.borrow();
-                let session = sessions
-                    .get(&self.id)
-                    .expect("internal passing-macro error: session lost");
-
-                let state = &mut *session.state.borrow_mut();
-
-                match state {
-                    SessionState::Idle => unreachable!(),
-                    SessionState::Requesting(_) => Poll::Pending,
-                    SessionState::Resolved(data) => {
-                        let data = data.clone();
-                        *state = SessionState::Idle;
-                        Poll::Ready(data)
-                    }
-                }
-            })
-        })
-        .await
+    pub fn eval(self) -> TokenStream {
+        self.0
+            .unwrap_or_else(|| panic_any(MissingContextPanicReason))
     }
 }
 
-pub fn export_data(vis: impl ToTokens, name: Ident, data: impl ToTokens) -> TokenStream {
-    let id = use_session_mgr(|mgr| {
-        mgr.gen.set(mgr.gen.get() + 1);
-        mgr.gen.get()
-    });
-    let id = Ident::new(&format!("__passing_macro_{id}"), name.span());
+pub fn export(
+    vis: impl ToTokens,
+    name: impl ToTokens,
+    data: impl ToTokens,
+) -> (Ident, TokenStream) {
+    let id = unique_ident(Span::mixed_site());
 
-    quote! {
+    let stream = quote! {
         #[macro_export]
         #[doc(hidden)]
         macro_rules! #id {
-            (__passing_macro_export $target:path ; $($prefix:tt)*) => {
-                $target!(__passing_macro_export $($prefix)* ; #data);
+            (
+                __import_context_passer [
+                    $({ $($input:tt)* })*
+                    ($next_path:path) $(($later_path:path))*
+                ]
+                $($args:tt)*
+            ) => {
+                $next_path! {
+                    __import_context_passer [
+                        $({ $($input)* })* { #data }
+                        $(($later_path))*
+                    ]
+                    $($args)*
+                }
             };
+            ($($tt:tt)*) => { ::core::compile_error!("cannot call this item directly as a macro") };
         }
 
+        #[doc(hidden)]
         #vis use #id as #name;
-    }
+    };
+
+    (id, stream)
+}
+
+pub fn unique_ident(span: Span) -> Ident {
+    const COMPILATION_TAG: u64 = const_random::const_random!(u64);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    Ident::new(
+        &format!(
+            "__unique_ident_{COMPILATION_TAG}_{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ),
+        span,
+    )
 }
