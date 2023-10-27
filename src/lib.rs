@@ -270,11 +270,11 @@ where
 }
 
 // LazyImportGroup
-pub struct LazyImportGroup<E> {
-    items: Vec<Rc<dyn ErasedLazyProcessor<Error = E>>>,
+pub struct LazyImportGroup<'a, E> {
+    items: Vec<Rc<dyn 'a + ErasedLazyProcessor<Error = E>>>,
 }
 
-impl<E> LazyImportGroup<E> {
+impl<E> LazyImportGroup<'_, E> {
     pub const fn new() -> Self {
         Self { items: Vec::new() }
     }
@@ -290,12 +290,12 @@ impl<E> LazyImportGroup<E> {
     }
 }
 
-impl<E: 'static> LazyImportGroup<E> {
-    pub fn import<T: 'static>(
+impl<'a, E: 'a> LazyImportGroup<'a, E> {
+    pub fn import<T: 'a>(
         &mut self,
         path: impl ToTokens,
-        f: impl 'static + FnOnce(TokenStream) -> Result<T, E>,
-    ) -> ComputedLazyImport<T> {
+        f: impl 'a + FnOnce(TokenStream) -> Result<T, E>,
+    ) -> ComputedLazyImport<'a, T> {
         let import = import(path);
         let processor = Rc::new(ConcreteLazyProcessor {
             inner: RefCell::new(ConcreteLazyProcessorInner::NotComputed(import, f)),
@@ -311,19 +311,19 @@ impl<E: 'static> LazyImportGroup<E> {
     }
 }
 
-impl<E> Default for LazyImportGroup<E> {
+impl<E> Default for LazyImportGroup<'_, E> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 // ComputedLazyImport
-pub struct ComputedLazyImport<T> {
-    processor: Rc<dyn SpecificLazyProcessor<Output = T>>,
+pub struct ComputedLazyImport<'a, T> {
+    processor: Rc<dyn 'a + SpecificLazyProcessor<Output = T>>,
     value: OnceCell<T>,
 }
 
-impl<T> ComputedLazyImport<T> {
+impl<T> ComputedLazyImport<'_, T> {
     fn init(&self) -> &T {
         self.value.get_or_init(|| self.processor.steal())
     }
@@ -334,7 +334,7 @@ impl<T> ComputedLazyImport<T> {
     }
 }
 
-impl<T> Deref for ComputedLazyImport<T> {
+impl<T> Deref for ComputedLazyImport<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -342,7 +342,7 @@ impl<T> Deref for ComputedLazyImport<T> {
     }
 }
 
-impl<T> DerefMut for ComputedLazyImport<T> {
+impl<T> DerefMut for ComputedLazyImport<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.init();
         self.value.get_mut().unwrap()
