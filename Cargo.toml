@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-const-random = "0.1.16"
+fastrand = "2.0.1"
 proc-macro2 = "1.0.69"
 quote = "1.0.33"

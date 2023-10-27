@@ -4,7 +4,6 @@ use std::{
     ops::{Deref, DerefMut},
     panic::{catch_unwind, panic_any, resume_unwind, AssertUnwindSafe},
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use proc_macro2::{Delimiter, Ident, Span, TokenStream, TokenTree};
@@ -188,15 +187,11 @@ pub fn export(
     (id, stream)
 }
 
-pub fn unique_ident(span: Span) -> Ident {
-    const COMPILATION_TAG: u64 = const_random::const_random!(u64);
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+pub const UNIQUE_IDENT_PREFIX: &str = "__gen_";
 
+pub fn unique_ident(span: Span) -> Ident {
     Ident::new(
-        &format!(
-            "__unique_ident_{COMPILATION_TAG}_{}",
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ),
+        &format!("{UNIQUE_IDENT_PREFIX}{:x}", fastrand::u128(..)),
         span,
     )
 }
