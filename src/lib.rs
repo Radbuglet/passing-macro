@@ -216,6 +216,7 @@ where
     F: FnOnce(TokenStream) -> Result<T, E>,
 {
     NotComputed(LazyImport, F),
+    Failed,
     Computed(Option<T>),
 }
 
@@ -239,6 +240,9 @@ where
                 "the entire LazyImportGroup must be evaluated before dereferencing a \
 				 ComputedLazyImport",
             ),
+            ConcreteLazyProcessorInner::Failed => {
+                panic!("this ComputedLazyImport failed to resolve without an error")
+            }
             ConcreteLazyProcessorInner::Computed(value) => value.take().unwrap(),
         }
     }
@@ -257,14 +261,15 @@ where
     type Error = E;
 
     fn compute(&self) -> Result<(), Self::Error> {
+        use ConcreteLazyProcessorInner::*;
         let inner = &mut *self.inner.borrow_mut();
 
-        match mem::replace(inner, ConcreteLazyProcessorInner::Computed(None)) {
-            ConcreteLazyProcessorInner::NotComputed(tokens, executor) => {
-                *inner = ConcreteLazyProcessorInner::Computed(Some(executor(tokens.eval())?));
+        match mem::replace(inner, Failed) {
+            NotComputed(tokens, executor) => {
+                *inner = Computed(Some(executor(tokens.eval())?));
                 Ok(())
             }
-            ConcreteLazyProcessorInner::Computed(_) => unreachable!(),
+            Failed | Computed(_) => unreachable!(),
         }
     }
 }
