@@ -1,11 +1,16 @@
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
+    mem,
+    ops::{Deref, DerefMut},
     panic::{catch_unwind, panic_any, resume_unwind, AssertUnwindSafe},
+    rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use proc_macro2::{Delimiter, Ident, Span, TokenStream, TokenTree};
 use quote::{quote, ToTokens};
+
+// === Core === //
 
 struct MissingContextPanicReason;
 
@@ -113,7 +118,7 @@ pub fn begin_import(
     })
 }
 
-pub fn import(path: impl ToTokens) -> LazyTokenStream {
+pub fn import(path: impl ToTokens) -> LazyImport {
     IMPORT_SESSION.with(|session| {
         let mut session = session.borrow_mut();
         let session = session
@@ -122,7 +127,7 @@ pub fn import(path: impl ToTokens) -> LazyTokenStream {
 
         session.requests.push(path.into_token_stream());
 
-        LazyTokenStream(
+        LazyImport(
             if let Some(input) = session.inputs.get(session.inputs_counter) {
                 session.inputs_counter += 1;
                 Some(input.clone())
@@ -134,9 +139,9 @@ pub fn import(path: impl ToTokens) -> LazyTokenStream {
 }
 
 #[derive(Debug, Clone)]
-pub struct LazyTokenStream(Option<TokenStream>);
+pub struct LazyImport(Option<TokenStream>);
 
-impl LazyTokenStream {
+impl LazyImport {
     pub fn clone_eval(&self) -> TokenStream {
         self.clone().eval()
     }
@@ -194,4 +199,152 @@ pub fn unique_ident(span: Span) -> Ident {
         ),
         span,
     )
+}
+
+// === Helpers === //
+
+// Internal Processor
+struct ConcreteLazyProcessor<T, E, F>
+where
+    F: FnOnce(TokenStream) -> Result<T, E>,
+{
+    inner: RefCell<ConcreteLazyProcessorInner<T, E, F>>,
+}
+
+enum ConcreteLazyProcessorInner<T, E, F>
+where
+    F: FnOnce(TokenStream) -> Result<T, E>,
+{
+    NotComputed(LazyImport, F),
+    Computed(Option<T>),
+}
+
+trait SpecificLazyProcessor {
+    type Output;
+
+    fn steal(&self) -> Self::Output;
+}
+
+impl<T, E, F> SpecificLazyProcessor for ConcreteLazyProcessor<T, E, F>
+where
+    F: FnOnce(TokenStream) -> Result<T, E>,
+{
+    type Output = T;
+
+    fn steal(&self) -> Self::Output {
+        let inner = &mut *self.inner.borrow_mut();
+
+        match inner {
+            ConcreteLazyProcessorInner::NotComputed(_, _) => panic!(
+                "the entire LazyImportGroup must be evaluated before dereferencing a \
+				 ComputedLazyImport",
+            ),
+            ConcreteLazyProcessorInner::Computed(value) => value.take().unwrap(),
+        }
+    }
+}
+
+trait ErasedLazyProcessor {
+    type Error;
+
+    fn compute(&self) -> Result<(), Self::Error>;
+}
+
+impl<T, E, F> ErasedLazyProcessor for ConcreteLazyProcessor<T, E, F>
+where
+    F: FnOnce(TokenStream) -> Result<T, E>,
+{
+    type Error = E;
+
+    fn compute(&self) -> Result<(), Self::Error> {
+        let inner = &mut *self.inner.borrow_mut();
+
+        match mem::replace(inner, ConcreteLazyProcessorInner::Computed(None)) {
+            ConcreteLazyProcessorInner::NotComputed(tokens, executor) => {
+                *inner = ConcreteLazyProcessorInner::Computed(Some(executor(tokens.eval())?));
+                Ok(())
+            }
+            ConcreteLazyProcessorInner::Computed(_) => unreachable!(),
+        }
+    }
+}
+
+// LazyImportGroup
+pub struct LazyImportGroup<E> {
+    items: Vec<Rc<dyn ErasedLazyProcessor<Error = E>>>,
+}
+
+impl<E> LazyImportGroup<E> {
+    pub const fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    pub fn eval(&mut self) -> Option<Vec<E>> {
+        let errors = self
+            .items
+            .drain(..)
+            .filter_map(|processor| processor.compute().err())
+            .collect::<Vec<_>>();
+
+        (!errors.is_empty()).then_some(errors)
+    }
+}
+
+impl<E: 'static> LazyImportGroup<E> {
+    pub fn import<T: 'static>(
+        &mut self,
+        path: impl ToTokens,
+        f: impl 'static + FnOnce(TokenStream) -> Result<T, E>,
+    ) -> ComputedLazyImport<T> {
+        let import = import(path);
+        let processor = Rc::new(ConcreteLazyProcessor {
+            inner: RefCell::new(ConcreteLazyProcessorInner::NotComputed(import, f)),
+        });
+
+        self.items
+            .push(Rc::clone(&processor) as Rc<dyn ErasedLazyProcessor<Error = E>>);
+
+        ComputedLazyImport {
+            processor,
+            value: OnceCell::new(),
+        }
+    }
+}
+
+impl<E> Default for LazyImportGroup<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ComputedLazyImport
+pub struct ComputedLazyImport<T> {
+    processor: Rc<dyn SpecificLazyProcessor<Output = T>>,
+    value: OnceCell<T>,
+}
+
+impl<T> ComputedLazyImport<T> {
+    fn init(&self) -> &T {
+        self.value.get_or_init(|| self.processor.steal())
+    }
+
+    pub fn into_inner(self) -> T {
+        self.init();
+        self.value.into_inner().unwrap()
+    }
+}
+
+impl<T> Deref for ComputedLazyImport<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.init()
+    }
+}
+
+impl<T> DerefMut for ComputedLazyImport<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.init();
+        self.value.get_mut().unwrap()
+    }
 }
